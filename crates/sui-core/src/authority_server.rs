@@ -10,11 +10,14 @@ use crate::{
     },
 };
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use fastcrypto::traits::KeyPair;
 use futures::{stream::BoxStream, TryStreamExt};
 use multiaddr::Multiaddr;
+use narwhal_config::{Import, WorkerCache};
 use prometheus::Registry;
 use std::{io, sync::Arc, time::Duration};
 use sui_config::NodeConfig;
@@ -170,7 +173,7 @@ impl ValidatorService {
         state: Arc<AuthorityState>,
         prometheus_registry: &Registry,
     ) -> Result<Self> {
-        let (tx_consensus_to_sui, rx_consensus_to_sui) = channel(1_000);
+        let (_tx_consensus_to_sui, rx_consensus_to_sui) = channel(1_000);
         let (tx_sui_to_consensus, rx_sui_to_consensus) = channel(1_000);
 
         // Spawn the consensus node of this authority.
@@ -180,14 +183,18 @@ impl ValidatorService {
         let consensus_keypair = config.protocol_key_pair().copy();
         let consensus_name = consensus_keypair.public().clone();
         let consensus_store = narwhal_node::NodeStorage::reopen(consensus_config.db_path());
+        let worker_cache = Arc::new(ArcSwap::from_pointee(
+            WorkerCache::import("some path").context("Failed to load the worker information")?,
+        ));
+        let worker_cache1 = worker_cache.clone();
         narwhal_node::Node::spawn_primary(
             consensus_keypair,
             config.genesis()?.narwhal_committee(),
+            worker_cache,
             &consensus_store,
             consensus_config.narwhal_config().to_owned(),
             /* consensus */ true, // Indicate that we want to run consensus.
             /* execution_state */ state.clone(),
-            /* tx_confirmation */ tx_consensus_to_sui,
             prometheus_registry,
         )
         .await?;
@@ -195,6 +202,7 @@ impl ValidatorService {
             consensus_name,
             /* ids */ vec![0], // We run a single worker with id '0'.
             config.genesis()?.narwhal_committee(),
+            worker_cache1,
             &consensus_store,
             consensus_config.narwhal_config().to_owned(),
             prometheus_registry,

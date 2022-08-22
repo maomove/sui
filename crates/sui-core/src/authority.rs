@@ -18,7 +18,9 @@ use fastcrypto::traits::KeyPair;
 use move_bytecode_utils::module_cache::SyncModuleCache;
 use move_core_types::{language_storage::ModuleId, resolver::ModuleResolver};
 use move_vm_runtime::{move_vm::MoveVM, native_functions::NativeFunctionTable};
-use narwhal_executor::ExecutionStateError;
+use narwhal_executor::{
+    BatchExecutionState, ExecutionStateError, SerializedTransaction, SingleExecutionState,
+};
 use narwhal_executor::{ExecutionIndices, ExecutionState};
 use parking_lot::Mutex;
 use prometheus::{
@@ -420,6 +422,102 @@ impl AuthorityState {
                 }
             }
         }
+    }
+
+    /// Execute a single batch of transactions.
+    async fn execute_batch(
+        &self,
+        execution_indices: &mut ExecutionIndices,
+        consensus_output: &narwhal_consensus::ConsensusOutput,
+        transactions: Vec<SerializedTransaction>,
+        total_batches: usize,
+    ) -> Result<(), SuiError> {
+        if transactions.is_empty() {
+            execution_indices.skip_batch(total_batches);
+            return Ok(());
+        }
+
+        // Execute every transaction in the batch.
+        let total_transactions = transactions.len();
+        for (index, transaction) in transactions.into_iter().enumerate() {
+            // Skip transactions that we already executed (after crash-recovery).
+            if execution_indices
+                .check_next_transaction_index(index as narwhal_types::SequenceNumber)
+            {
+                // Execute the transaction
+                self.execute_transaction(
+                    execution_indices,
+                    consensus_output,
+                    transaction,
+                    total_batches,
+                    total_transactions,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// This function will be called by Narwhal, after Narwhal sequenced this certificate.
+    #[instrument(level = "trace", skip_all)]
+    async fn execute_transaction(
+        &self,
+        execution_indices: &mut ExecutionIndices,
+        consensus_output: &narwhal_consensus::ConsensusOutput,
+        transaction: SerializedTransaction,
+        total_batches: usize,
+        total_transactions: usize,
+    ) -> Result<(), SuiError> {
+        // Compute the next expected indices. Those will be persisted upon transaction execution
+        // and are only used for crash-recovery.
+        execution_indices.next(total_batches, total_transactions);
+
+        // The consensus simply orders bytes, so we first need to deserialize the transaction.
+        // If the deserialization fail it is safe to ignore the transaction since all correct
+        // clients will do the same. Remember that a bad authority or client may input random
+        // bytes to the consensus.
+        let (result, _outcome) = match bincode::deserialize::<
+            <AuthorityState as SingleExecutionState>::Transaction,
+        >(&transaction)
+        {
+            Err(e) => {
+                let error = narwhal_executor::SubscriberError::ClientExecutionError(format!(
+                    "Failed to deserialize transaction: {e}"
+                ));
+                // There is always a chance that the fault lies with our deserialization.
+                debug!("{error}");
+                (Ok(()), Err(error))
+            }
+            Ok(transaction) => {
+                // Execute the transaction. Note that the executor will need to choose whether to discard
+                // transactions from previous epochs by itself.
+                let result = self
+                    .handle_consensus_transaction(
+                        consensus_output,
+                        execution_indices.clone(),
+                        transaction,
+                    )
+                    .await;
+
+                match result {
+                    Ok(outcome) => (Ok(()), Ok(outcome)),
+                    Err(error) => match narwhal_executor::SubscriberError::from(error.clone()) {
+                        // We may want to log the errors that are the user's fault (i.e., that are neither
+                        // our fault or the fault of consensus) for debug purposes. It is safe to continue
+                        // by ignoring those transactions since all honest subscribers will do the same.
+                        non_fatal @ narwhal_executor::SubscriberError::ClientExecutionError(_) => {
+                            debug!("{non_fatal}");
+                            (Ok(()), Err(non_fatal))
+                        }
+                        // We must take special care to errors that are our fault, such as storage errors.
+                        // We may be the only authority experiencing it, and thus cannot continue to process
+                        // transactions until the problem is fixed.
+                        fatal => (Err(error), Err(fatal)),
+                    },
+                }
+            }
+        };
+        result
     }
 
     /// We cannot use handle_certificate in fullnode to execute a certificate because there is no
@@ -1699,8 +1797,58 @@ impl AuthorityState {
 
 #[async_trait]
 impl ExecutionState for AuthorityState {
-    type Transaction = ConsensusTransaction;
     type Error = SuiError;
+
+    fn ask_consensus_write_lock(&self) -> bool {
+        self.consensus_guardrail.fetch_add(1, Ordering::SeqCst) == 0
+    }
+
+    fn release_consensus_write_lock(&self) {
+        self.consensus_guardrail.fetch_sub(0, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl BatchExecutionState for AuthorityState {
+    async fn load_next_certificate_index(
+        &self,
+    ) -> Result<narwhal_types::SequenceNumber, Self::Error> {
+        let indices = self.database.last_consensus_index()?;
+        Ok(indices.next_certificate_index)
+    }
+
+    async fn handle_consensus(
+        &self,
+        consensus_output: &narwhal_consensus::ConsensusOutput,
+        transaction_batches: Vec<Vec<SerializedTransaction>>,
+    ) -> Result<(), Self::Error> {
+        let mut execution_indices = self.database.last_consensus_index()?;
+        if transaction_batches.is_empty() {
+            execution_indices.skip_certificate();
+        } else {
+            // Execute every batch in the certificate.
+            let total_batches = transaction_batches.len();
+            for (index, batch) in transaction_batches.into_iter().enumerate() {
+                // Skip batches that we already executed (after crash-recovery).
+                if execution_indices.check_next_batch_index(index as narwhal_types::SequenceNumber)
+                {
+                    self.execute_batch(
+                        &mut execution_indices,
+                        consensus_output,
+                        batch,
+                        total_batches,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SingleExecutionState for AuthorityState {
+    type Transaction = ConsensusTransaction;
     type Outcome = Vec<u8>;
 
     /// This function will be called by Narwhal, after Narwhal sequenced this certificate.
@@ -1766,14 +1914,6 @@ impl ExecutionState for AuthorityState {
                 Ok(Vec::default())
             }
         }
-    }
-
-    fn ask_consensus_write_lock(&self) -> bool {
-        self.consensus_guardrail.fetch_add(1, Ordering::SeqCst) == 0
-    }
-
-    fn release_consensus_write_lock(&self) {
-        self.consensus_guardrail.fetch_sub(0, Ordering::SeqCst);
     }
 
     async fn load_execution_indices(&self) -> Result<ExecutionIndices, Self::Error> {

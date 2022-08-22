@@ -65,6 +65,9 @@ impl Genesis {
             .validator_set
             .iter()
             .map(|validator| {
+                // Strong requirement here for narwhal and sui to be on the same version of fastcrypto
+                // for AuthorityPublicBytes to cast to type alias PublicKey defined in narwhal to
+                // construct narwhal Committee struct.
                 let name = validator
                     .protocol_key()
                     .try_into()
@@ -73,20 +76,9 @@ impl Genesis {
                     primary_to_primary: validator.narwhal_primary_to_primary.clone(),
                     worker_to_primary: validator.narwhal_worker_to_primary.clone(),
                 };
-                let workers = [(
-                    0, // worker_id
-                    narwhal_config::WorkerInfo {
-                        primary_to_worker: validator.narwhal_primary_to_worker.clone(),
-                        transactions: validator.narwhal_consensus_address.clone(),
-                        worker_to_worker: validator.narwhal_worker_to_worker.clone(),
-                    },
-                )]
-                .into_iter()
-                .collect();
                 let authority = narwhal_config::Authority {
                     stake: validator.stake as narwhal_config::Stake, //TODO this should at least be the same size integer
                     primary,
-                    workers,
                 };
 
                 (name, authority)
