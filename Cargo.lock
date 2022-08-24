@@ -7588,6 +7588,7 @@ dependencies = [
  "static_assertions",
  "strum",
  "strum_macros",
+ "test-utils",
  "thiserror",
  "tonic",
  "tracing",
